@@ -158,8 +158,8 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin d
 ## 10. Clone Repo and Prepare Cloud Env (On VM)
 
 ```bash
-git clone <your-repo-url>
-cd "debate agent"
+git clone https://github.com/BHUVI-SHIP-IT/multi-agent-debate-system.git
+cd multi-agent-debate-system
 cp .env.cloud.example .env.cloud
 ```
 
