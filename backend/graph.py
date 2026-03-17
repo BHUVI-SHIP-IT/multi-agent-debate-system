@@ -1,4 +1,4 @@
-from typing import Annotated, List, Dict, TypedDict
+from typing import Annotated, List, Dict, TypedDict, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 import operator
@@ -20,6 +20,7 @@ class DebateState(TypedDict):
     search_queries: Annotated[List[str], append_list]
     background_context: str
     verdict: str
+    verdict_data: Dict[str, Any]
 
 def route_from_moderator(state: DebateState):
     if state["current_round"] > state["max_rounds"]:

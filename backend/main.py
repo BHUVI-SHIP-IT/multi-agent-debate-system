@@ -18,6 +18,17 @@ app.add_middleware(
 def read_root():
     return {"message": "AI Debate Backend is running."}
 
+# Maps LangGraph node names to the role label sent to the frontend.
+# This ensures the correct card styling regardless of conversation list state.
+NODE_ROLE_MAP = {
+    "moderator": "moderator",
+    "researcher": "researcher",
+    "pro_agent": "pro",
+    "opponent_agent": "opponent",
+    "fact_checker": "fact_checker",
+    "verdict_agent": "verdict",
+}
+
 @app.websocket("/ws/debate")
 async def debate_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -37,7 +48,8 @@ async def debate_endpoint(websocket: WebSocket):
                 "conversation": [],
                 "fact_checking_results": [],
                 "rules": "",
-                "verdict": ""
+                "verdict": "",
+                "verdict_data": {}
             }
 
             print(f"Starting debate on topic: {topic}")
@@ -51,19 +63,24 @@ async def debate_endpoint(websocket: WebSocket):
                         if "conversation" in state_update and state_update["conversation"] is not None and len(state_update["conversation"]) > 0:
                             # Send the latest message 
                             last_msg = state_update["conversation"][-1]
-                            
-                            await websocket.send_json({
-                                "type": "agent_message",
-                                "agent": node_name,
-                                "role": last_msg["role"],
-                                "content": last_msg["content"]
-                            })
+                            # Use node_name → role mapping for reliable card styling
+                            role = NODE_ROLE_MAP.get(node_name, last_msg.get("role", node_name))
+
+                            # Prevent duplicate verdict payloads: final verdict is sent below as a dedicated event.
+                            if not (role == "verdict" and state_update.get("verdict")):
+                                await websocket.send_json({
+                                    "type": "agent_message",
+                                    "agent": node_name,
+                                    "role": role,
+                                    "content": last_msg["content"]
+                                })
                         
                         if "verdict" in state_update and state_update.get("verdict"):
                             # Final verdict reached
                             await websocket.send_json({
                                 "type": "verdict",
-                                "content": state_update["verdict"]
+                                "content": state_update["verdict"],
+                                "verdict_data": state_update.get("verdict_data", {})
                             })
 
                     # Small delay to simulate human typing/reading on front end
