@@ -1,14 +1,18 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import json
-import asyncio
-from graph import debate_graph
+from graph import build_debate_graph
+from debate_manager import DebateJobManager
+from event_bus import build_event_bus
+from state_store import build_state_store
+from checkpointer import checkpointer_context
+from settings import settings
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -18,77 +22,96 @@ app.add_middleware(
 def read_root():
     return {"message": "AI Debate Backend is running."}
 
-# Maps LangGraph node names to the role label sent to the frontend.
-# This ensures the correct card styling regardless of conversation list state.
-NODE_ROLE_MAP = {
-    "moderator": "moderator",
-    "researcher": "researcher",
-    "pro_agent": "pro",
-    "opponent_agent": "opponent",
-    "fact_checker": "fact_checker",
-    "verdict_agent": "verdict",
-}
+debate_manager: DebateJobManager | None = None
+_checkpointer_cm = None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global debate_manager
+    global _checkpointer_cm
+
+    _checkpointer_cm = checkpointer_context()
+    checkpointer = await _checkpointer_cm.__aenter__()
+
+    debate_graph = build_debate_graph(checkpointer=checkpointer)
+    state_store = build_state_store()
+    event_bus = build_event_bus()
+    debate_manager = DebateJobManager(debate_graph, state_store, event_bus)
+    await debate_manager.startup()
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global _checkpointer_cm
+
+    if debate_manager is not None:
+        await debate_manager.shutdown()
+
+    if _checkpointer_cm is not None:
+        await _checkpointer_cm.__aexit__(None, None, None)
+        _checkpointer_cm = None
 
 @app.websocket("/ws/debate")
 async def debate_endpoint(websocket: WebSocket):
+    manager = debate_manager
+    if manager is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "message": "Debate manager is not initialized yet."})
+        await websocket.close()
+        return
+
     await websocket.accept()
     print("WebSocket connected.")
     try:
         while True:
-            # Wait for user topic
             data = await websocket.receive_text()
             payload = json.loads(data)
-            topic = payload.get("topic", "AI Replacing Programmers")
-            
-            # Initialize State
-            initial_state = {
-                "topic": topic,
-                "current_round": 0,
-                "max_rounds": 2,
-                "conversation": [],
-                "fact_checking_results": [],
-                "rules": "",
-                "verdict": "",
-                "verdict_data": {}
-            }
+            debate_id = payload.get("debate_id")
 
-            print(f"Starting debate on topic: {topic}")
-            
-            # Stream events from LangGraph
-            async for event in debate_graph.astream(initial_state, stream_mode="updates"):
-                for node_name, state_update in event.items():
-                    # We send the updates to the frontend
-                    
-                    if isinstance(state_update, dict):
-                        if "conversation" in state_update and state_update["conversation"] is not None and len(state_update["conversation"]) > 0:
-                            # Send the latest message 
-                            last_msg = state_update["conversation"][-1]
-                            # Use node_name → role mapping for reliable card styling
-                            role = NODE_ROLE_MAP.get(node_name, last_msg.get("role", node_name))
+            if debate_id:
+                debate = await manager.get_debate(debate_id)
+                if debate is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": f"Unknown debate_id: {debate_id}",
+                        }
+                    )
+                    continue
+                await websocket.send_json(
+                    {
+                        "type": "debate_started",
+                        "debate_id": debate_id,
+                        "topic": debate.get("topic", ""),
+                    }
+                )
 
-                            # Prevent duplicate verdict payloads: final verdict is sent below as a dedicated event.
-                            if not (role == "verdict" and state_update.get("verdict")):
-                                await websocket.send_json({
-                                    "type": "agent_message",
-                                    "agent": node_name,
-                                    "role": role,
-                                    "content": last_msg["content"]
-                                })
-                        
-                        if "verdict" in state_update and state_update.get("verdict"):
-                            # Final verdict reached
-                            await websocket.send_json({
-                                "type": "verdict",
-                                "content": state_update["verdict"],
-                                "verdict_data": state_update.get("verdict_data", {})
-                            })
+                await manager.resume_debate(debate_id)
+            else:
+                topic = payload.get("topic", "AI Replacing Programmers")
+                max_rounds = int(payload.get("max_rounds", 2))
+                debate_id = await manager.start_debate(topic=topic, max_rounds=max_rounds)
 
-                    # Small delay to simulate human typing/reading on front end
-                    await asyncio.sleep(1)
+                await websocket.send_json(
+                    {
+                        "type": "debate_started",
+                        "debate_id": debate_id,
+                        "topic": topic,
+                    }
+                )
+
+            async with manager.subscribe(debate_id) as queue:
+                while True:
+                    event = await queue.get()
+                    await websocket.send_json(event)
+
+                    if event.get("type") in {"completed", "error"}:
+                        break
 
     except WebSocketDisconnect:
         print("WebSocket disconnected.")
         
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

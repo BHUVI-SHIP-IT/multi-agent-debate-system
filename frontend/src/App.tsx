@@ -209,7 +209,9 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
-    const socket = new WebSocket('ws://localhost:8000/ws/debate');
+    const envWsUrl = import.meta.env.VITE_WS_URL as string | undefined;
+    const fallbackWsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/debate`;
+    const socket = new WebSocket(envWsUrl || fallbackWsUrl);
 
     socket.onopen = () => console.log('WebSocket connected');
 
@@ -370,8 +372,8 @@ function App() {
                 <div className="rounded-xl border border-slate-200 bg-white p-3 space-y-3">
                   {CRITERIA.filter((criterion) => criterion.key !== 'total').map((criterion) => {
                     const max = criterion.max ?? 1;
-                    const proScore = msg.verdictData.scores.pro[criterion.key];
-                    const opponentScore = msg.verdictData.scores.opponent[criterion.key];
+                    const proScore = msg.verdictData?.scores.pro[criterion.key] ?? 0;
+                    const opponentScore = msg.verdictData?.scores.opponent[criterion.key] ?? 0;
                     const proWidth = `${Math.min(100, (proScore / max) * 100)}%`;
                     const opponentWidth = `${Math.min(100, (opponentScore / max) * 100)}%`;
 

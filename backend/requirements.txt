@@ -1,0 +1,14 @@
+langgraph
+langgraph-checkpoint-postgres
+langchain
+langchain-ollama
+ollama
+fastapi
+chromadb
+uvicorn
+websockets
+pydantic
+tavily-python
+python-dotenv
+redis
+psycopg[binary]

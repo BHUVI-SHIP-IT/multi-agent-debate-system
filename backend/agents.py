@@ -1,21 +1,27 @@
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from database import query_knowledge_base, clear_knowledge_base, add_to_knowledge_base
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import os
 import json
 import re
 from typing import Dict, Any
 from dotenv import load_dotenv
 from tavily import TavilyClient
+from settings import settings
+from topic_cache import topic_context_cache
 
 load_dotenv()
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
+_tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
+tavily_client = TavilyClient(api_key=_tavily_api_key) if _tavily_api_key else None
 
 # We'll use llama3 as the default local model
 # Ensure you have it pulled locally: ollama run llama3.2
-MODEL = "llama3.2"
-base_llm = ChatOllama(model=MODEL, temperature=0.7)
-strict_llm = ChatOllama(model=MODEL, temperature=0.1)
+MODEL = settings.model_name
+base_llm = ChatOllama(model=MODEL, base_url=settings.ollama_base_url, temperature=0.7)
+strict_llm = ChatOllama(model=MODEL, base_url=settings.ollama_base_url, temperature=0.1)
+NODE_EXECUTOR = ThreadPoolExecutor(max_workers=settings.node_executor_workers)
 
 CRITERIA_WEIGHTS = {
     "argument_quality": 25,
@@ -219,22 +225,38 @@ def run_moderator(state: dict) -> dict:
 
 def run_researcher(state: dict) -> dict:
     topic = state["topic"]
+    debate_id = state.get("debate_id", "default")
+
+    cached_context = topic_context_cache.get(topic)
+    if cached_context:
+        clear_knowledge_base(debate_id)
+        add_to_knowledge_base(cached_context.split("\n"), debate_id)
+        return {
+            "search_queries": [topic],
+            "background_context": cached_context,
+            "conversation": [{"role": "researcher", "content": f"Loaded cached context for the debate:\n{cached_context}"}],
+        }
     
     # Clear the knowledge base from the previous debate
-    clear_knowledge_base()
+    clear_knowledge_base(debate_id)
     
     try:
+        if tavily_client is None:
+            raise RuntimeError("Tavily API key not configured")
+
         # Perform a web search to gather recent news and context
         search_result = tavily_client.search(query=topic, search_depth="basic", max_results=3)
         context_snippets = [f"- {res['title']}: {res['content']}" for res in search_result.get("results", [])]
         
         # Add the fresh web snippets into the local Vector DB for fact checking
         if context_snippets:
-            add_to_knowledge_base(context_snippets)
+            add_to_knowledge_base(context_snippets, debate_id)
             
         background_context = "\n".join(context_snippets)
         if not background_context:
             background_context = "No recent web results found."
+        else:
+            topic_context_cache.set(topic, background_context)
     except Exception as e:
         background_context = f"Failed to retrieve web search context: {str(e)}"
     
@@ -285,6 +307,7 @@ def run_opponent_agent(state: dict) -> dict:
 def run_fact_checker(state: dict) -> dict:
     conversation = state.get("conversation", [])
     background_context = state.get("background_context", "")
+    debate_id = state.get("debate_id", "default")
     
     if not conversation:
         return {}
@@ -293,7 +316,7 @@ def run_fact_checker(state: dict) -> dict:
     last_msg = conversation[-1]["content"]
     
     # Query ChromaDB (Local Knowledge)
-    facts = query_knowledge_base(last_msg)
+    facts = query_knowledge_base(last_msg, debate_id)
     
     # We combine local facts with recent web context
     all_facts = f"Database Facts:\\n{facts}\\n\\nRecent Web Context:\\n{background_context}"
@@ -357,3 +380,32 @@ Rules:
         "verdict_data": verdict_data,
         "conversation": [{"role": "verdict", "content": json.dumps(verdict_data, ensure_ascii=True)}],
     }
+
+
+async def _run_node_in_executor(node_fn, state: dict) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(NODE_EXECUTOR, node_fn, state)
+
+
+async def arun_moderator(state: dict) -> dict:
+    return await _run_node_in_executor(run_moderator, state)
+
+
+async def arun_researcher(state: dict) -> dict:
+    return await _run_node_in_executor(run_researcher, state)
+
+
+async def arun_pro_agent(state: dict) -> dict:
+    return await _run_node_in_executor(run_pro_agent, state)
+
+
+async def arun_opponent_agent(state: dict) -> dict:
+    return await _run_node_in_executor(run_opponent_agent, state)
+
+
+async def arun_fact_checker(state: dict) -> dict:
+    return await _run_node_in_executor(run_fact_checker, state)
+
+
+async def arun_verdict_agent(state: dict) -> dict:
+    return await _run_node_in_executor(run_verdict_agent, state)
